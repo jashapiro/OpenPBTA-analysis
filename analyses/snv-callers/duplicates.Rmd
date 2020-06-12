@@ -1,0 +1,304 @@
+---
+title: "Duplicate SNV Tests"
+output: html_notebook
+params:
+  sqlite: "../../scratch/snv_db.sqlite"
+---
+
+There are apparently some duplicate records in the consensus SNV calls. This notebook is to explore their origins.
+
+```{r setup}
+library(dplyr)
+```
+
+Connect to the database file (specified in params) and set up tables.
+```{r}
+con <- DBI::dbConnect(RSQLite::SQLite(), params$sqlite)
+strelka <- tbl(con, "strelka")
+lancet <- tbl(con, "lancet")
+mutect <- tbl(con, "mutect")
+consensus <- tbl(con, "consensus")
+```
+
+The fields that _should_ make for a unique SNV are:
+
+```{r fields}
+full_col_order <- colnames(strelka)
+
+# Specify the columns to join by
+join_cols <- c(
+  "Chromosome",
+  "Start_Position",
+  "Reference_Allele",
+  "Allele",
+  "Tumor_Sample_Barcode"
+)
+
+```
+
+
+So lets use those to find if there are duplicates, and how many of each.
+
+```{r duplist}
+dup_table <- function(snv_table){
+  snv_table %>%
+    group_by(Chromosome, 
+             Start_Position, 
+             Reference_Allele, 
+             Allele, 
+             Tumor_Sample_Barcode) %>%
+    tally() %>%
+    filter(n > 1) %>%
+    as_tibble()
+}
+
+tables <- list(strelka = strelka, lancet = lancet, mutect = mutect, consensus = consensus)
+
+dups <- tables %>% 
+  purrr::map(dup_table)
+```
+
+```{r}
+dups %>% purrr::map(dim)
+```
+So only lancet and the consensus have duplicates by these criteria.
+Interestingly, the consensus has 34 duplicate positions, but only 24 for lancet.
+
+Lets look at the lancet duplicates first
+```{r}
+lancet_dups <- lancet %>%
+  inner_join(select(dups$lancet, !n),
+             copy = TRUE) %>%
+  as_tibble()
+```
+
+
+Looking at the first two rows, we can see that the duplicated calls are identical but for the coverage columns, and columns derived from them
+
+```{r}
+all.equal(lancet_dups[1,-1], lancet_dups[2,-1])
+```
+```{r}
+lancet_dups[1:2,]
+```
+
+Exploring other duplicates we see similar patterns most of the time, but sometimes the duplicates are identical across all fields:
+```{r}
+all.equal(lancet_dups[3,-1], lancet_dups[4,-1])
+```
+
+
+## Investigating the other duplicates
+
+### Conensus duplciates
+```{r}
+consensus_dups <- consensus %>%
+  inner_join(select(dups$consensus, !n),
+             copy = TRUE) %>%
+  as_tibble()
+```
+
+So here we have 68 duplicate rows based on location. Lets examine those a bit.
+This time it appears that the process of generating the consensus means that all of these are equal across all columns.
+
+```{r}
+consensus_dups %>%
+  group_by(Chromosome, 
+           Start_Position, 
+           Reference_Allele, 
+           Allele, 
+           Tumor_Sample_Barcode) %>%
+  summarise_all(function(x){max(x)==min(x)})
+
+```
+
+
+Lets look at the duplicates that are unique to the consensus and see where they might have come from.
+
+```{r}
+consensus_only <- consensus_dups %>%
+  select(join_cols) %>%
+  anti_join(lancet_dups) %>%
+  unique()
+consensus_only
+```
+
+Now lets pull these sites from the original tables
+```{r}
+consensus_dup_origins <- tables %>%
+  purrr::map(~ inner_join(., consensus_only, copy = TRUE) %>% as_tibble())
+```
+```{r}
+consensus_dup_origins %>% purrr::map(nrow)
+```
+So all of the samples are present in the original data frames, but one row each.
+
+At a glance, I can find nothin unusual in these entries, so I am somewhat baffled.
+```{r}
+consensus_dup_origins$lancet
+```
+
+Lets try joining them?
+This is the same code as in the original merge, in theory.
+
+```{r}
+consensus_dup_origins$mutect %>%
+  dplyr::inner_join(consensus_dup_origins$lancet, by = join_cols) %>%
+  dplyr::select(join_cols) %>%
+  dplyr::inner_join(consensus_dup_origins$strelka, by = join_cols)
+```
+
+Still just 17 rows. Mysterious.
+
+
+### Origins of consensus dups
+
+Does removing the duplicates from lancet solve all of our problems?
+
+Lets make a table `lancet-dedup` that has all of lancet data except the duplicated snvs. We will exclude all of the duplicates at this stage because it is easier at this stage, rather than picking one representative row.
+
+```{r dedup}
+lancet_dedup <- lancet %>%
+  filter(!index %in% local(lancet_dups$index))
+```
+
+Now the code for making the consensus without MNVs, with lancet_dedup substituted
+
+```{r}
+
+# Create the consensus for non-MNVs
+consensus_new <- mutect %>%
+  dplyr::inner_join(lancet_dedup, by = join_cols) %>%
+  dplyr::select(join_cols) %>%
+  dplyr::inner_join(strelka, by = join_cols) %>%
+  dplyr::select(full_col_order, -index)
+```
+```{r}
+explain(consensus_new)
+```
+
+```{r}
+consensus_new_dups <- dup_table(consensus_new)
+consensus_new_dups
+```
+
+Okay! so no duplicates at that stage. Now, migth they be coming in with the MNV separation? That seems plausible.
+
+Read in the split mnv script
+```{r}
+source(file.path("util", "split_mnv.R"))
+```
+
+```{r}
+split_mutect_df <- split_mnv(mutect)
+split_lancet_df <- split_mnv(lancet_dedup)
+```
+
+Check these for duplicates:
+```{r}
+dup_table(split_mutect_df)
+dup_table(split_lancet_df)
+```
+AHA!
+
+We have found the culprit!
+
+Okay, lets analyzse split_mnv.R
+
+The first step is this:
+```{r}
+mnv_df <- lancet_dedup %>%
+  dplyr::filter(Variant_Type %in% c("DNP", "TNP", "ONP")) %>%
+  as.data.frame() %>%
+  # add a mnv_id for calculating positions, and for potential later
+  # reconstitution of MNVs.
+  dplyr::mutate(mnv_id = dplyr::row_number()) %>%
+  # lancet adds a base to the start of MNV `Allele` fields, so check for that
+  # and remove the extra base.
+  dplyr::mutate(
+    Allele = dplyr::case_when(
+      stringr::str_length(Allele) == stringr::str_length(Reference_Allele) ~
+      Allele,
+      stringr::str_length(Allele) == stringr::str_length(Reference_Allele) + 1 ~
+      stringr::str_sub(Allele, 2)
+    )
+  )
+```
+
+Any dups here?
+
+```{r}
+dup_table(mnv_df)
+```
+
+Not yet... next step:
+```{r}
+  if ("Match_Norm_Seq_Allele1" %in% colnames(mnv_df)) {
+    mnv_df <- mnv_df %>%
+      tidyr::separate_rows(
+        Reference_Allele,
+        Tumor_Seq_Allele1,
+        Tumor_Seq_Allele2,
+        Match_Norm_Seq_Allele1,
+        Match_Norm_Seq_Allele2,
+        Allele,
+        sep = "(?<=[A-Za-z])"
+      )
+  } else {
+    mnv_df <- mnv_df %>%
+      tidyr::separate_rows(
+        Reference_Allele,
+        Tumor_Seq_Allele1,
+        Tumor_Seq_Allele2,
+        Allele,
+        sep = "(?<=[A-Za-z])"
+      )
+  }
+```
+
+Lots of dups at this stage, but that makes sense, as we have separated rows but not recalculated start positions yet.
+```{r}
+dup_table(mnv_df)
+```
+
+Filter off blank alleles from the split
+```{r}
+ mnv_df <- mnv_df %>%
+    # character separation leaves an extra blank
+    dplyr::filter(
+      Reference_Allele != "",
+      Allele != ""
+    )
+```
+
+next step
+```{r}
+mnv_df <- mnv_df %>%
+  dplyr::group_by(mnv_id) %>%
+    dplyr::mutate(
+      mnv_pos = dplyr::row_number(),
+      Start_Position = Start_Position + mnv_pos - 1,
+      End_Position = Start_Position
+    ) %>%
+  ungroup()
+```
+
+```{r}
+mnv_df %>% filter(Start_Position == 100383969) %>%
+  select(index, Hugo_Symbol, Chromosome, Start_Position, vcf_pos)
+```
+
+
+And there it is: 2 MNVs with different start positions, but that overlap.
+
+Looking at them in the original lancet df:
+
+```{r}
+lancet %>% 
+  filter(vcf_pos %in% c(100383967, 100383968)) %>%
+  select(Tumor_Sample_Barcode, Start_Position, Variant_Type, Reference_Allele, Tumor_Seq_Allele1, Tumor_Seq_Allele2) %>%
+  as.data.frame() 
+```
+
+
+
