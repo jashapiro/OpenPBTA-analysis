@@ -36,15 +36,13 @@ vardict <- tbl(con, "vardict")
 ### Look at the mutation types
 
 ```{r}
-strelka_vars <- count(strelka, Variant_Type, name = 'n_strelka') %>% 
-  as.data.frame()
-lancet_vars <- count(lancet, Variant_Type, name = 'n_lancet') %>% 
-  as.data.frame() 
-mutect_vars <- count(mutect, Variant_Type, name = 'n_mutect') %>%
-  as.data.frame()
+lancet_vars <- count(lancet, Variant_Type, name = 'n_lancet') 
+mutect_vars <- count(mutect, Variant_Type, name = 'n_mutect')
+strelka_vars <- count(strelka, Variant_Type, name = 'n_strelka') 
 
-variant_counts <- full_join(strelka_vars, lancet_vars, by = 'Variant_Type') %>%
-  full_join(mutect_vars, by = 'Variant_Type') 
+variant_counts <- left_join(lancet_vars, mutect_vars, by = 'Variant_Type') %>%
+  left_join(strelka_vars, by = 'Variant_Type') %>%
+  as.data.frame()
 
 variant_counts
 ```
@@ -66,11 +64,11 @@ join_cols = c("Chromosome",
               "Allele",
               "Tumor_Sample_Barcode")
 
-full_consensus <- strelka %>% 
-  inner_join(lancet,
+full_consensus <- lancet %>% 
+  inner_join(mutect,
              by = join_cols,
              suffix = c("s", "l")) %>%
-  inner_join(mutect,
+  inner_join(strelka,
              by = join_cols,
              suffix = c("s", "m")) %>%
   select(c(join_cols, 'Variant_Type'))
@@ -87,58 +85,19 @@ consensus_vartypes <- full_consensus %>%
 ## Compare to the full table
 consensus_vartypes %>% 
   left_join(variant_counts) %>%
-  mutate(frac_strelka = n_consensus / n_strelka,
-         frac_lancet = n_consensus / n_lancet,
-         frac_mutect = n_consensus / n_mutect )
+  mutate(frac_lancet = n_consensus / n_lancet,
+         frac_mutect = n_consensus / n_mutect,
+         frac_strelka = n_consensus / n_strelka
+         )
 ```
 So we are keeping only (last check) 45% of lancet insertions and 32% of deletions, compared to 75% of SNPs. 
 That is not terrible, but not great.
 
-### Deletion investigation
+## Deletion investigation
 
 Deletions might be called in the same approximate location, but different callers might choose slightly different places to call, making things ambiguous. 
 For example, the change of `CATATAT -> CAT` could be called as a 4 base deletion starting at position 2 or position 4. 
 Do we see evidence of these kinds of ambiguity?
-
-Let's start by looking at the distribution of deletion lengths for each caller.
-
-```{r}
-strelka_lens <- strelka %>%
-  filter(Variant_Type == 'DEL') %>%
-  mutate(length = End_Position - Start_Position + 1) %>%
-  count(length) %>%
-  as.data.frame()
-
-lancet_lens <- lancet %>%
-  filter(Variant_Type == 'DEL') %>%
-  mutate(length = End_Position - Start_Position + 1) %>%
-  count(length) %>%
-  as.data.frame()
-
-mutect_lens <- mutect %>%
-  filter(Variant_Type == 'DEL') %>%
-  mutate(length = End_Position - Start_Position + 1) %>%
-  count(length) %>%
-  as.data.frame()
-
-del_lengths <- bind_rows(strelka = strelka_lens, 
-                         lancet = lancet_lens, 
-                         mutect = mutect_lens, 
-                         .id = "caller")
-```
-
-Plot the lengths
-```{r}
-ggplot(del_lengths, aes(x = length, y = n)) + 
-  geom_col() +
-  facet_grid(rows = 'caller', scales = "free_y") + 
-  coord_cartesian(xlim = c(0, 25)) + 
-  theme_bw()
-```
-Interesting that mutect has more of a propensity for calling even size deletions, but I'm not quite sure what to do with that info...
-
-More generally, it does look like most of the calls are 1-5 bp, so we can probably focus on those, but room for ambiguity among callers still seems high.
-How can we find places where the "same call" might be missed?
 
 Let's start by getting all the deletions into "regular" data frames. 
 We will add a column for deletion length, calculated two ways, and reduce the column list to what we need to save space.
@@ -149,6 +108,7 @@ wanted_cols <- c(
   "Chromosome",
   "Start_Position",
   "End_Position",
+  "Variant_Type",
   "Reference_Allele",
   "Allele",
   "Tumor_Sample_Barcode",
@@ -156,15 +116,7 @@ wanted_cols <- c(
   "t_ref_count",
   "t_alt_count")
 
-strelka_dels <- strelka %>%
-  filter(Variant_Type == 'DEL')  %>%
-  select(wanted_cols) %>%
-  as.data.frame() %>%
-  mutate(length = End_Position - Start_Position + 1,
-         # calculate the length for deletions that don't go to 0
-         del_length = stringr::str_length(Reference_Allele) -
-                      stringr::str_length(stringr::str_replace(Allele, '-', ''))
-         )
+
 lancet_dels <- lancet %>%
   filter(Variant_Type == 'DEL')  %>%
   select(wanted_cols) %>%
@@ -183,6 +135,58 @@ mutect_dels <- mutect %>%
          del_length = stringr::str_length(Reference_Allele) -
                       stringr::str_length(stringr::str_replace(Allele, '-', ''))
          )
+
+strelka_dels <- strelka %>%
+  filter(Variant_Type == 'DEL')  %>%
+  select(wanted_cols) %>%
+  as.data.frame() %>%
+  mutate(length = End_Position - Start_Position + 1,
+         # calculate the length for deletions that don't go to 0
+         del_length = stringr::str_length(Reference_Allele) -
+                      stringr::str_length(stringr::str_replace(Allele, '-', ''))
+         )
 ```
+
+
+Let's start by looking at the distribution of deletion lengths for each caller.
+
+```{r}
+caller_lengths <- bind_rows(
+  lancet = count(lancet_dels, length), 
+  mutect = count(mutect_dels, length), 
+  strelka = count(strelka_dels, length), 
+  .id = "caller")
+
+caller_del_lengths <- bind_rows(
+  lancet = count(lancet_dels, del_length), 
+  mutect = count(mutect_dels, del_length), 
+  strelka = count(strelka_dels, del_length), 
+  .id = "caller")
+```
+
+Plot the nominal lengths
+```{r}
+ggplot(caller_lengths, aes(x = length, y = n)) + 
+  geom_col() +
+  facet_grid(rows = 'caller', scales = "free_y") + 
+  coord_cartesian(xlim = c(0, 25)) + 
+  theme_bw()
+```
+Interesting that mutect has more of a propensity for calling even size deletions, but I'm not quite sure what to do with that info...
+
+Plot the actual lengths inferred from alleles...
+```{r}
+ggplot(caller_del_lengths, aes(x = del_length, y = n)) + 
+  geom_col() +
+  facet_grid(rows = 'caller', scales = "free_y") + 
+  coord_cartesian(xlim = c(0, 25)) + 
+  theme_bw()
+```
+Doesn't fix mutects problem, though you can see where mutect is calling SNVs as DEL. Odd.
+
+
+More generally, it does look like the vast majority of the calls are 1-5 bp, so we can probably focus on those, but room for ambiguity among callers still seems high.
+How can we find places where the "same call" might be missed?
+
 
 
