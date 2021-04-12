@@ -1,0 +1,188 @@
+---
+title: "Investigation of indel consensus calling"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+##Setup
+```{r}
+library(tidyverse)
+library(ggplot2)
+```
+
+# Files and directories
+```{r}
+root_dir <- rprojroot::find_root(rprojroot::has_dir(".git"))
+db_file <- file.path(root_dir, "scratch", "snv_db.sqlite")
+```
+
+### Connect to the database
+
+```{r}
+con <- DBI::dbConnect(RSQLite::SQLite(), db_file)
+DBI::dbListTables(con)
+```
+
+### Set up tables
+```{r}
+meta <- tbl(con, "samples")
+strelka <- tbl(con, "strelka")
+lancet <- tbl(con, "lancet")
+mutect <- tbl(con, "mutect")
+vardict <- tbl(con, "vardict")
+```
+
+### Look at the mutation types
+
+```{r}
+strelka_vars <- count(strelka, Variant_Type, name = 'n_strelka') %>% 
+  as.data.frame()
+lancet_vars <- count(lancet, Variant_Type, name = 'n_lancet') %>% 
+  as.data.frame() 
+mutect_vars <- count(mutect, Variant_Type, name = 'n_mutect') %>%
+  as.data.frame()
+
+variant_counts <- full_join(strelka_vars, lancet_vars, by = 'Variant_Type') %>%
+  full_join(mutect_vars, by = 'Variant_Type') 
+
+variant_counts
+```
+
+
+
+### Find intersection of all
+Note that running the block below does no actual processing, it just sets up the query.
+Processing will be only be done when we try to look at it.
+
+```{r}
+# Use this so we can make columns back to traditional MAF order after join
+full_col_order <- colnames(strelka)
+
+join_cols = c("Chromosome",
+              "Start_Position",
+              "End_Position",
+              "Reference_Allele",
+              "Allele",
+              "Tumor_Sample_Barcode")
+
+full_consensus <- strelka %>% 
+  inner_join(lancet,
+             by = join_cols,
+             suffix = c("s", "l")) %>%
+  inner_join(mutect,
+             by = join_cols,
+             suffix = c("s", "m")) %>%
+  select(c(join_cols, 'Variant_Type'))
+```
+
+Now let's look at the variant type breakdown in the consensus. 
+We know that we will be missing the `DNP`, `TNP` and `ONP` classes, but how about the INS and DEL?
+
+```{r}
+consensus_vartypes <- full_consensus %>% 
+  count(Variant_Type, name = 'n_consensus') %>%
+  as.data.frame()
+
+## Compare to the full table
+consensus_vartypes %>% 
+  left_join(variant_counts) %>%
+  mutate(frac_strelka = n_consensus / n_strelka,
+         frac_lancet = n_consensus / n_lancet,
+         frac_mutect = n_consensus / n_mutect )
+```
+So we are keeping only (last check) 45% of lancet insertions and 32% of deletions, compared to 75% of SNPs. 
+That is not terrible, but not great.
+
+### Deletion investigation
+
+Deletions might be called in the same approximate location, but different callers might choose slightly different places to call, making things ambiguous. 
+For example, the change of `CATATAT -> CAT` could be called as a 4 base deletion starting at position 2 or position 4. 
+Do we see evidence of these kinds of ambiguity?
+
+Let's start by looking at the distribution of deletion lengths for each caller.
+
+```{r}
+strelka_lens <- strelka %>%
+  filter(Variant_Type == 'DEL') %>%
+  mutate(length = End_Position - Start_Position + 1) %>%
+  count(length) %>%
+  as.data.frame()
+
+lancet_lens <- lancet %>%
+  filter(Variant_Type == 'DEL') %>%
+  mutate(length = End_Position - Start_Position + 1) %>%
+  count(length) %>%
+  as.data.frame()
+
+mutect_lens <- mutect %>%
+  filter(Variant_Type == 'DEL') %>%
+  mutate(length = End_Position - Start_Position + 1) %>%
+  count(length) %>%
+  as.data.frame()
+
+del_lengths <- bind_rows(strelka = strelka_lens, 
+                         lancet = lancet_lens, 
+                         mutect = mutect_lens, 
+                         .id = "caller")
+```
+
+Plot the lengths
+```{r}
+ggplot(del_lengths, aes(x = length, y = n)) + 
+  geom_col() +
+  facet_grid(rows = 'caller', scales = "free_y") + 
+  coord_cartesian(xlim = c(0, 25)) + 
+  theme_bw()
+```
+Interesting that mutect has more of a propensity for calling even size deletions, but I'm not quite sure what to do with that info...
+
+More generally, it does look like most of the calls are 1-5 bp, so we can probably focus on those, but room for ambiguity among callers still seems high.
+How can we find places where the "same call" might be missed?
+
+Let's start by getting all the deletions into "regular" data frames. 
+We will add a column for deletion length, calculated two ways, and reduce the column list to what we need to save space.
+
+
+```{r}
+wanted_cols <- c(
+  "Chromosome",
+  "Start_Position",
+  "End_Position",
+  "Reference_Allele",
+  "Allele",
+  "Tumor_Sample_Barcode",
+  "t_depth",
+  "t_ref_count",
+  "t_alt_count")
+
+strelka_dels <- strelka %>%
+  filter(Variant_Type == 'DEL')  %>%
+  select(wanted_cols) %>%
+  as.data.frame() %>%
+  mutate(length = End_Position - Start_Position + 1,
+         # calculate the length for deletions that don't go to 0
+         del_length = stringr::str_length(Reference_Allele) -
+                      stringr::str_length(stringr::str_replace(Allele, '-', ''))
+         )
+lancet_dels <- lancet %>%
+  filter(Variant_Type == 'DEL')  %>%
+  select(wanted_cols) %>%
+  as.data.frame() %>%
+  mutate(length = End_Position - Start_Position + 1,
+         # calculate the length for deletions that don't go to 0
+         del_length = stringr::str_length(Reference_Allele) -
+                      stringr::str_length(stringr::str_replace(Allele, '-', ''))
+         )
+mutect_dels <- mutect %>%
+  filter(Variant_Type == 'DEL')  %>%
+  select(wanted_cols) %>%
+  as.data.frame() %>%
+  mutate(length = End_Position - Start_Position + 1,
+         # calculate the length for deletions that don't go to 0
+         del_length = stringr::str_length(Reference_Allele) -
+                      stringr::str_length(stringr::str_replace(Allele, '-', ''))
+         )
+```
+
+
