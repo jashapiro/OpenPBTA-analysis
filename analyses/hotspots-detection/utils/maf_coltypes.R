@@ -18,6 +18,13 @@
 
 library(readr)
 
+# get command line args with output file location
+args = commandArgs(trailingOnly=TRUE)
+if (length(args)==0) {
+    stop("One argument to give the location of the output RDS is required.")
+}
+outfile = args[1]
+
 maf_coltypes <- cols(Hugo_Symbol=col_character(),
                      Entrez_Gene_Id=col_character(),
                      Center=col_character(),
@@ -121,5 +128,5 @@ maf_coltypes <- cols(Hugo_Symbol=col_character(),
                      )
 
 # Save as RDS to read into the following scripts while reading maf files
-saveRDS(maf_coltypes,"input/maf_coltypes.RDS")
+saveRDS(maf_coltypes, outfile)
 

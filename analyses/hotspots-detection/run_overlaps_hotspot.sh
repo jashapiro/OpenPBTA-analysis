@@ -15,7 +15,7 @@ genomic_site_hotspot_file=input/tert_promoter_hotspots.tsv
 
 # Create the maf_coltypes.RDS 
 # this will help in reading maf files correctly in following scripts
-Rscript maf_coltypes.R
+Rscript utils/maf_coltypes.R input/maf_coltypes.RDS
 
 # tmp directory in scratch folder to save intermediate filtered maf files
 tmp_dir="../../scratch/hotspot-detection"
